@@ -71,7 +71,7 @@ struct LockData {
     boost::mutex dd_mutex;
 } static lockdata;
 
-boost::thread_specific_ptr<LockStack> lockstack;
+boost::thread_specific_ptr<LockStack> lockstack([](LockStack* ptr) { delete ptr; });
 
 static void potential_deadlock_detected(const std::pair<void*, void*>& mismatch, const LockStack& s1, const LockStack& s2)
 {
