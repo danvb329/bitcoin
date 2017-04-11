@@ -1296,6 +1296,21 @@ void static InvalidBlockFound(CBlockIndex *pindex, const CValidationState &state
     }
 }
 
+/** Apply the effects of a block on the utxo cache, ignoring that it may already have been applied. */
+static void ReplayBlock(const CBlock& block, CCoinsViewCache& inputs, int nHeight)
+{
+    for (const CTransactionRef& tx : block.vtx) {
+        if (!tx->IsCoinBase()) {
+            for (const CTxIn &txin : tx->vin) {
+                inputs.ModifyCoins(txin.prevout.hash)->Spend(txin.prevout.n);
+            }
+        }
+        // We cannot use ModifyNewCoins here, as we don't know that entry
+        // doesn't exist in the cache yet.
+        inputs.ModifyCoins(tx->GetHash())->FromTx(*tx, nHeight);
+    }
+}
+
 void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txundo, int nHeight)
 {
     // mark inputs spent
@@ -2006,7 +2021,7 @@ bool static FlushStateToDisk(CValidationState &state, FlushStateMode mode, int n
         nLastSetChain = nNow;
     }
     int64_t nMempoolSizeMax = GetArg("-maxmempool", DEFAULT_MAX_MEMPOOL_SIZE) * 1000000;
-    int64_t cacheSize = pcoinsTip->DynamicMemoryUsage() * DB_PEAK_USAGE_FACTOR;
+    int64_t cacheSize = pcoinsTip->DynamicMemoryUsage();
     int64_t nTotalSpace = nCoinCacheUsage + std::max<int64_t>(nMempoolSizeMax - nMempoolUsage, 0);
     // The cache is large and we're within 10% and 200 MiB or 50% and 50MiB of the limit, but we have time now (not in the middle of a block processing).
     bool fCacheLarge = mode == FLUSH_STATE_PERIODIC && cacheSize > std::min(std::max(nTotalSpace / 2, nTotalSpace - MIN_BLOCK_COINSDB_USAGE * 1024 * 1024),
@@ -3562,20 +3577,26 @@ bool static LoadBlockIndexDB(const CChainParams& chainparams)
     pblocktree->ReadFlag("txindex", fTxIndex);
     LogPrintf("%s: transaction index %s\n", __func__, fTxIndex ? "enabled" : "disabled");
 
+    LoadChainTip(chainparams);
+    return true;
+}
+
+void LoadChainTip(const CChainParams& chainparams)
+{
+    if (chainActive.Tip() && chainActive.Tip()->GetBlockHash() == pcoinsTip->GetBestBlock()) return;
+
     // Load pointer to end of best chain
     BlockMap::iterator it = mapBlockIndex.find(pcoinsTip->GetBestBlock());
     if (it == mapBlockIndex.end())
-        return true;
+        return;
     chainActive.SetTip(it->second);
 
     PruneBlockIndexCandidates();
 
-    LogPrintf("%s: hashBestChain=%s height=%d date=%s progress=%f\n", __func__,
+    LogPrintf("Loaded best chain: hashBestChain=%s height=%d date=%s progress=%f\n",
         chainActive.Tip()->GetBlockHash().ToString(), chainActive.Height(),
         DateTimeStrFormat("%Y-%m-%d %H:%M:%S", chainActive.Tip()->GetBlockTime()),
         GuessVerificationProgress(chainparams.TxData(), chainActive.Tip()));
-
-    return true;
 }
 
 CVerifyDB::CVerifyDB()
@@ -3678,6 +3699,51 @@ bool CVerifyDB::VerifyDB(const CChainParams& chainparams, CCoinsView *coinsview,
     LogPrintf("[DONE].\n");
     LogPrintf("No coin database inconsistencies in last %i blocks (%i transactions)\n", chainActive.Height() - pindexState->nHeight, nGoodTransactions);
 
+    return true;
+}
+
+bool ReplayBlocks(const CChainParams& params, CCoinsView* view)
+{
+    LOCK(cs_main);
+
+    CCoinsViewCache cache(view);
+
+    uint256 hashBest = view->GetBestBlock();
+    uint256 hashUpto = view->GetUptoBlock();
+
+    if (hashUpto.IsNull() || hashBest == hashUpto) return true;
+
+    if (mapBlockIndex.count(hashUpto) == 0 ||
+        (!hashBest.IsNull() && mapBlockIndex.count(hashBest) == 0)) {
+        return error("ReplayBlocks(): chainstate boundaries not in block index");
+    }
+    auto pindexUpto = mapBlockIndex[hashUpto];
+
+    int nHeight = 1; // Skip the genesis block
+    if (mapBlockIndex.count(hashBest)) {
+        auto pindexBest = mapBlockIndex[hashBest];
+        if (pindexUpto->GetAncestor(pindexBest->nHeight) != pindexBest) {
+            return error("ReplayBlocks(): chainstate tip does not derive from final boundary");
+        }
+        nHeight = std::max(nHeight, pindexBest->nHeight);
+    }
+
+    uiInterface.ShowProgress(_("Replaying blocks..."), 0);
+    LogPrintf("Replaying %i blocks\n", pindexUpto->nHeight - nHeight);
+
+    while (nHeight < pindexUpto->nHeight) {
+        ++nHeight;
+        auto pindex = pindexUpto->GetAncestor(nHeight);
+        CBlock block;
+        if (!ReadBlockFromDisk(block, pindex, params.GetConsensus())) {
+            return error("ReplayBlocks(): ReadBlockFromDisk failed at %d, hash=%s", pindex->nHeight, pindex->GetBlockHash().ToString());
+        }
+        ReplayBlock(block, cache, pindex->nHeight);
+    }
+    cache.SetBestBlock(hashUpto);
+
+    cache.Flush();
+    uiInterface.ShowProgress("", 100);
     return true;
 }
 

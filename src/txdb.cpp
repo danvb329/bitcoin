@@ -20,6 +20,7 @@ static const char DB_TXINDEX = 't';
 static const char DB_BLOCK_INDEX = 'b';
 
 static const char DB_BEST_BLOCK = 'B';
+static const char DB_BEST_BLOCK_UPTO = 'U';
 static const char DB_FLAG = 'F';
 static const char DB_REINDEX_FLAG = 'R';
 static const char DB_LAST_BLOCK = 'l';
@@ -44,10 +45,21 @@ uint256 CCoinsViewDB::GetBestBlock() const {
     return hashBestChain;
 }
 
+uint256 CCoinsViewDB::GetUptoBlock() const {
+    uint256 hashBestChain;
+    if (!db.Read(DB_BEST_BLOCK_UPTO, hashBestChain))
+        return uint256();
+    return hashBestChain;
+}
+
 bool CCoinsViewDB::BatchWrite(CCoinsMap &mapCoins, const uint256 &hashBlock) {
     CDBBatch batch(db);
     size_t count = 0;
     size_t changed = 0;
+    size_t batch_size = (size_t)GetArg("-dbbatchsize", nDefaultDbBatchSize) << 20;
+    if (!hashBlock.IsNull()) {
+        batch.Write(DB_BEST_BLOCK_UPTO, hashBlock);
+    }
     for (CCoinsMap::iterator it = mapCoins.begin(); it != mapCoins.end();) {
         if (it->second.flags & CCoinsCacheEntry::DIRTY) {
             if (it->second.coins.IsPruned())
@@ -59,12 +71,20 @@ bool CCoinsViewDB::BatchWrite(CCoinsMap &mapCoins, const uint256 &hashBlock) {
         count++;
         CCoinsMap::iterator itOld = it++;
         mapCoins.erase(itOld);
+        if (batch.SizeEstimate() > batch_size) {
+            LogPrint(BCLog::COINDB, "Writing partial batch of %.2f MiB\n", batch.SizeEstimate() * (1.0 / 1048576.0));
+            db.WriteBatch(batch);
+            batch.Clear();
+        }
     }
-    if (!hashBlock.IsNull())
+    if (!hashBlock.IsNull()) {
         batch.Write(DB_BEST_BLOCK, hashBlock);
+    }
 
-    LogPrint(BCLog::COINDB, "Committing %u changed transactions (out of %u) to coin database...\n", (unsigned int)changed, (unsigned int)count);
-    return db.WriteBatch(batch);
+    LogPrint(BCLog::COINDB, "Writing final batch of %.2f MiB\n", batch.SizeEstimate() * (1.0 / 1048576.0));
+    bool ret = db.WriteBatch(batch);
+    LogPrint(BCLog::COINDB, "Committed %u changed transactions (out of %u) to coin database...\n", (unsigned int)changed, (unsigned int)count);
+    return ret;
 }
 
 CBlockTreeDB::CBlockTreeDB(size_t nCacheSize, bool fMemory, bool fWipe) : CDBWrapper(GetDataDir() / "blocks" / "index", nCacheSize, fMemory, fWipe) {
