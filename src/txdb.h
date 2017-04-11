@@ -22,9 +22,7 @@ class CCoinsViewDBCursor;
 class uint256;
 
 //! No need to periodic flush if at least this much space still available.
-static constexpr int MAX_BLOCK_COINSDB_USAGE = 200;
-//! Always periodic flush if less than this much space still available.
-static constexpr int MIN_BLOCK_COINSDB_USAGE = 50;
+static constexpr int MAX_BLOCK_COINSDB_USAGE = 10;
 //! -dbcache default (MiB)
 static const int64_t nDefaultDbCache = 450;
 //! -dbbatchsize default (MiB)
