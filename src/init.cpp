@@ -1448,6 +1448,8 @@ bool AppInitMain(boost::thread_group& threadGroup, CScheduler& scheduler)
                     //If we're reindexing in prune mode, wipe away unusable block files and all undo data files
                     if (fPruneMode)
                         CleanupBlockRevFiles();
+                } else {
+                    pcoinsdbview->Upgrade();
                 }
 
                 if (!LoadBlockIndex(chainparams)) {

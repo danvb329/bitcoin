@@ -17,6 +17,7 @@
 #include <boost/thread.hpp>
 
 static const char DB_COINS = 'C';
+static const char DB_COINS_OLD = 'c';
 static const char DB_BLOCK_FILES = 'f';
 static const char DB_TXINDEX = 't';
 static const char DB_BLOCK_INDEX = 'b';
@@ -270,4 +271,121 @@ bool CBlockTreeDB::LoadBlockIndexGuts(boost::function<CBlockIndex*(const uint256
     }
 
     return true;
+}
+
+namespace {
+
+class COldCoins
+{
+public:
+    //! whether transaction is a coinbase
+    bool fCoinBase;
+
+    //! unspent transaction outputs; spent outputs are .IsNull(); spent outputs at the end of the array are dropped
+    std::vector<CTxOut> vout;
+
+    //! at which height this transaction was included in the active block chain
+    int nHeight;
+
+    //! version of the CTransaction; accesses to this value should probably check for nHeight as well,
+    //! as new tx version will probably only be introduced at certain heights
+    int nVersion;
+
+    //! empty constructor
+    COldCoins() : fCoinBase(false), vout(0), nHeight(0), nVersion(0) { }
+
+    /**
+     * calculate number of bytes for the bitmask, and its number of non-zero bytes
+     * each bit in the bitmask represents the availability of one output, but the
+     * availabilities of the first two outputs are encoded separately
+     */
+    void CalcMaskSize(unsigned int &nBytes, unsigned int &nNonzeroBytes) const {
+        unsigned int nLastUsedByte = 0;
+        for (unsigned int b = 0; 2+b*8 < vout.size(); b++) {
+            bool fZero = true;
+            for (unsigned int i = 0; i < 8 && 2+b*8+i < vout.size(); i++) {
+                if (!vout[2+b*8+i].IsNull()) {
+                    fZero = false;
+                    continue;
+                }
+            }
+            if (!fZero) {
+                nLastUsedByte = b + 1;
+                nNonzeroBytes++;
+            }
+        }
+        nBytes += nLastUsedByte;
+    }
+
+    template<typename Stream>
+    void Unserialize(Stream &s) {
+        unsigned int nCode = 0;
+        // version
+        ::Unserialize(s, VARINT(this->nVersion));
+        // header code
+        ::Unserialize(s, VARINT(nCode));
+        fCoinBase = nCode & 1;
+        std::vector<bool> vAvail(2, false);
+        vAvail[0] = (nCode & 2) != 0;
+        vAvail[1] = (nCode & 4) != 0;
+        unsigned int nMaskCode = (nCode / 8) + ((nCode & 6) != 0 ? 0 : 1);
+        // spentness bitmask
+        while (nMaskCode > 0) {
+            unsigned char chAvail = 0;
+            ::Unserialize(s, chAvail);
+            for (unsigned int p = 0; p < 8; p++) {
+                bool f = (chAvail & (1 << p)) != 0;
+                vAvail.push_back(f);
+            }
+            if (chAvail != 0)
+                nMaskCode--;
+        }
+        // txouts themself
+        vout.assign(vAvail.size(), CTxOut());
+        for (unsigned int i = 0; i < vAvail.size(); i++) {
+            if (vAvail[i])
+                ::Unserialize(s, REF(CTxOutCompressor(vout[i])));
+        }
+        // coinbase height
+        ::Unserialize(s, VARINT(nHeight));
+    }
+};
+
+}
+
+void CCoinsViewDB::Upgrade() {
+    std::unique_ptr<CDBIterator> pcursor(db.NewIterator());
+    pcursor->Seek(std::make_pair(DB_COINS_OLD, uint256()));
+    if (!pcursor->Valid()) {
+        return;
+    }
+
+    LogPrintf("Upgrading database...\n");
+    size_t batch_size = (size_t)GetArg("-dbbatchsize", nDefaultDbBatchSize) << 20;
+    CDBBatch batch(db);
+    while (pcursor->Valid()) {
+        boost::this_thread::interruption_point();
+        COldCoins oldcoins;
+        std::pair<unsigned char, uint256> key;
+        if (pcursor->GetValue(oldcoins) && pcursor->GetKey(key) && key.first == DB_COINS_OLD) {
+            COutPoint outpoint(key.second, 0);
+            for (size_t i = 0; i < oldcoins.vout.size(); ++i) {
+                if (!oldcoins.vout[i].IsNull() && !oldcoins.vout[i].scriptPubKey.IsUnspendable()) {
+                    CCoins newcoins(std::move(oldcoins.vout[i]), oldcoins.nHeight, oldcoins.fCoinBase);
+                    outpoint.n = i;
+                    CoinsEntry entry(&outpoint);
+                    batch.Write(entry, newcoins);
+                }
+            }
+            batch.Erase(key);
+            if (batch.SizeEstimate() > batch_size) {
+                db.WriteBatch(batch);
+                batch.Clear();
+            }
+            pcursor->Next();
+        } else {
+            break;
+        }
+    }
+    db.WriteBatch(batch);
 }

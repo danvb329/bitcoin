@@ -79,6 +79,8 @@ public:
     uint256 GetUptoBlock() const;
     bool BatchWrite(CCoinsMap &mapCoins, const uint256 &hashBlock);
     CCoinsViewCursor *Cursor() const;
+
+    void Upgrade();
 };
 
 /** Specialization of CCoinsViewCursor to iterate over a CCoinsViewDB */
